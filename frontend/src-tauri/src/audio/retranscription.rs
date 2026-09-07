@@ -1,5 +1,6 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
+use crate::api::TranscriptSegment;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
@@ -417,6 +418,28 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
+    // Guard: the save step below deletes every existing transcript row for the
+    // meeting before inserting replacements. If every ASR result came back
+    // empty, continuing would permanently erase the prior transcript and
+    // overwrite transcripts.json with an empty file — abort instead.
+    if all_transcripts.is_empty() {
+        warn!(
+            "Retranscription for meeting {} produced no usable text across {} segment(s); preserving existing transcript",
+            meeting_id, processable_count
+        );
+        emit_progress(
+            &app,
+            &meeting_id,
+            "error",
+            100,
+            "No transcribable speech detected. Existing transcript preserved.",
+        );
+        return Err(anyhow!(
+            "No transcribable speech detected in {} audio segment(s)",
+            processable_count
+        ));
+    }
+
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
     // Create transcript segments with proper timestamps from VAD
@@ -427,43 +450,12 @@ async fn run_retranscription<R: Runtime>(
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
-    // Wrap delete+insert+update in a transaction to prevent data loss
-    let pool = app_state.db_manager.pool();
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
-    let mut tx = sqlx::Connection::begin(&mut *conn)
-        .await
-        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
-
-    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
-
-    for segment in &segments {
-        sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&segment.id)
-        .bind(&meeting_id)
-        .bind(&segment.text)
-        .bind(&segment.timestamp)
-        .bind(segment.audio_start_time)
-        .bind(segment.audio_end_time)
-        .bind(segment.duration)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
-    }
-
-    tx.commit().await
-        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+    let saved_count =
+        replace_meeting_transcripts(app_state.db_manager.pool(), &meeting_id, &segments).await?;
 
     info!(
         "Updated {} transcripts for meeting {} in transaction",
-        segments.len(),
-        meeting_id
+        saved_count, meeting_id
     );
 
     // Write updated transcripts.json and metadata.json to the meeting folder
@@ -497,6 +489,59 @@ async fn run_retranscription<R: Runtime>(
         duration_seconds,
         language,
     })
+}
+
+/// Replace all stored transcript rows for a meeting inside a single transaction.
+///
+/// The existing rows are deleted before the replacements are inserted, so an
+/// empty `segments` list would permanently erase the meeting's transcript.
+/// Returns an error instead of deleting when there is nothing to insert.
+async fn replace_meeting_transcripts(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    segments: &[TranscriptSegment],
+) -> Result<usize> {
+    if segments.is_empty() {
+        return Err(anyhow!(
+            "Refusing to delete existing transcripts for meeting {}: no replacement segments",
+            meeting_id
+        ));
+    }
+
+    // Wrap delete+insert in a transaction to prevent data loss
+    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
+
+    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
+
+    for segment in segments {
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&segment.id)
+        .bind(meeting_id)
+        .bind(&segment.text)
+        .bind(&segment.timestamp)
+        .bind(segment.audio_start_time)
+        .bind(segment.audio_end_time)
+        .bind(segment.duration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+
+    Ok(segments.len())
 }
 
 /// Emit progress event
@@ -1050,5 +1095,109 @@ mod tests {
         assert_eq!(metadata["summary_language"], "fr");
         assert_eq!(metadata["custom_field"], "preserve me");
         assert!(metadata.get("detected_summary_language").is_none());
+    }
+
+    /// In-memory SQLite pool with the schema the transcripts save path needs.
+    /// `max_connections(1)` keeps the whole test on one connection so the
+    /// in-memory database persists across statements.
+    async fn test_db_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create in-memory pool");
+        sqlx::query(
+            "CREATE TABLE meetings (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE transcripts (
+                id TEXT PRIMARY KEY,
+                meeting_id TEXT NOT NULL,
+                transcript TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                summary TEXT,
+                action_items TEXT,
+                key_points TEXT,
+                audio_start_time REAL,
+                audio_end_time REAL,
+                duration REAL,
+                speaker TEXT,
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at)
+             VALUES ('meeting-1', 'Test meeting', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
+             VALUES ('t1', 'meeting-1', 'existing transcript', '2026-01-01T00:00:01Z', 0.0, 1.0, 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn transcript_count(pool: &sqlx::SqlitePool, meeting_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_meeting_transcripts_preserves_existing_rows_when_empty() {
+        let pool = test_db_pool().await;
+
+        // All-empty ASR output must fail instead of deleting prior rows.
+        let err = replace_meeting_transcripts(&pool, "meeting-1", &[])
+            .await
+            .expect_err("empty replacement must fail");
+        assert!(err.to_string().contains("no replacement segments"));
+
+        assert_eq!(transcript_count(&pool, "meeting-1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn replace_meeting_transcripts_replaces_rows_atomically() {
+        let pool = test_db_pool().await;
+        let segments = create_transcript_segments(&[
+            ("new transcript".to_string(), 0.0, 1500.0),
+            ("second".to_string(), 1500.0, 3000.0),
+        ]);
+
+        let saved = replace_meeting_transcripts(&pool, "meeting-1", &segments)
+            .await
+            .expect("non-empty replacement succeeds");
+        assert_eq!(saved, 2);
+        assert_eq!(transcript_count(&pool, "meeting-1").await, 2);
+
+        let texts: Vec<String> = sqlx::query_scalar(
+            "SELECT transcript FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time",
+        )
+        .bind("meeting-1")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            texts,
+            vec!["new transcript".to_string(), "second".to_string()]
+        );
     }
 }
